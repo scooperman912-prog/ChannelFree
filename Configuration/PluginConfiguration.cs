@@ -16,7 +16,7 @@ public class PluginConfiguration : BasePluginConfiguration
     /// <summary>Max output height (720 keeps the server + Roku happy).</summary>
     public int MaxHeight { get; set; } = 720;
 
-    /// <summary>Encode channel streams on the GPU (VA-API) when /dev/dri is available.</summary>
+    /// <summary>Encode channel streams on the GPU: VA-API when /dev/dri is available, VideoToolbox on macOS.</summary>
     public bool UseHardwareEncoding { get; set; } = true;
 
     /// <summary>VA-API render device.</summary>

@@ -280,7 +280,7 @@ public class QuasiTvController : ControllerBase
         var workDir = Path.Combine(Path.GetTempPath(), "cablepackage", Guid.NewGuid().ToString("N"));
         double streamSeconds = 0; // running output timestamp, so items join into one continuous stream
         var quickExits = 0;
-        var useHw = Config.UseHardwareEncoding && System.IO.File.Exists(Config.VaapiDevice);
+        var hw = PickHardware();
         var bumperBroken = false;
 
         try
@@ -328,7 +328,7 @@ public class QuasiTvController : ControllerBase
                         {
                             bumperRun = true;
                             _logger.LogInformation("QuasiTV: {Channel} bumper -> {Title}", channel.Name, slot.Item.Name);
-                            await RunBumper(bumperArgs, streamSeconds, useHw, run.Token).ConfigureAwait(false);
+                            await RunBumper(bumperArgs, streamSeconds, hw, run.Token).ConfigureAwait(false);
                         }
                     }
 
@@ -354,8 +354,8 @@ public class QuasiTvController : ControllerBase
                                 }
                             }
 
-                            _logger.LogInformation("QuasiTV: {Channel} playing {Title} from {Offset:hh\\:mm\\:ss}{Trim} ({Encoder})", channel.Name, slot.Item.Name, itemOffset, slot.Trimmed ? $", credits cut at {slot.Play:hh\\:mm\\:ss}" : string.Empty, useHw ? "vaapi" : "x264");
-                            await RunFfmpeg(slot.Item.Path, AudioMap(slot.Item), itemOffset, slot.Trimmed ? remaining : null, streamSeconds, useHw, banner, run.Token).ConfigureAwait(false);
+                            _logger.LogInformation("QuasiTV: {Channel} playing {Title} from {Offset:hh\\:mm\\:ss}{Trim} ({Encoder})", channel.Name, slot.Item.Name, itemOffset, slot.Trimmed ? $", credits cut at {slot.Play:hh\\:mm\\:ss}" : string.Empty, hw switch { HwEncoder.Vaapi => "vaapi", HwEncoder.VideoToolbox => "videotoolbox", _ => "x264" });
+                            await RunFfmpeg(slot.Item.Path, AudioMap(slot.Item), itemOffset, slot.Trimmed ? remaining : null, streamSeconds, hw, banner, run.Token).ConfigureAwait(false);
                         }
                     }
                 }
@@ -394,10 +394,10 @@ public class QuasiTvController : ControllerBase
                         continue; // showBanner is already false
                     }
 
-                    if (useHw)
+                    if (hw != HwEncoder.None)
                     {
                         _logger.LogWarning("QuasiTV: hardware encode failed on {Title}; falling back to software for this stream", slot.Item.Name);
-                        useHw = false;
+                        hw = HwEncoder.None;
                         continue;
                     }
 
@@ -453,7 +453,7 @@ public class QuasiTvController : ControllerBase
 
     /// <summary>Play one library item from <paramref name="offset"/>. If <paramref name="playFor"/> is set (credits cut short),
     /// stop there with a 1.5 s fade to black + audio fade.</summary>
-    private async Task RunFfmpeg(string path, string audioMap, TimeSpan offset, TimeSpan? playFor, double tsOffsetSeconds, bool useHw, string banner, CancellationToken ct)
+    private async Task RunFfmpeg(string path, string audioMap, TimeSpan offset, TimeSpan? playFor, double tsOffsetSeconds, HwEncoder hw, string banner, CancellationToken ct)
     {
         var inv = CultureInfo.InvariantCulture;
         var maxH = Math.Clamp(Config.MaxHeight, 360, 1080);
@@ -477,7 +477,13 @@ public class QuasiTvController : ControllerBase
             af = (af.Length > 0 ? af + "," : string.Empty) + $"afade=t=out:st={fadeAt}:d={fadeLen}";
         }
 
-        var args = HwInit(useHw);
+        var args = HwInit(hw);
+        if (hw == HwEncoder.VideoToolbox)
+        {
+            // Decode on the media engine too; frames come back to system memory for the CPU filters.
+            args.AddRange(new[] { "-hwaccel", "videotoolbox" });
+        }
+
         args.AddRange(new[]
         {
             "-re",
@@ -491,22 +497,22 @@ public class QuasiTvController : ControllerBase
             args.AddRange(new[] { "-t", t.TotalSeconds.ToString("0.000", inv) });
         }
 
-        args.AddRange(new[] { "-vf", useHw ? vf + ",format=nv12,hwupload" : vf });
+        args.AddRange(new[] { "-vf", hw == HwEncoder.Vaapi ? vf + ",format=nv12,hwupload" : vf });
         if (af.Length > 0)
         {
             args.AddRange(new[] { "-af", af });
         }
 
-        args.AddRange(EncoderArgs(useHw, tsOffsetSeconds));
+        args.AddRange(EncoderArgs(hw, tsOffsetSeconds));
         await Pump(args, ct).ConfigureAwait(false);
     }
 
     /// <summary>Play an "Up Next" bumper (inputs + filter graph from <see cref="Bumper.Build"/>).</summary>
-    private async Task RunBumper(List<string> bumperArgs, double tsOffsetSeconds, bool useHw, CancellationToken ct)
+    private async Task RunBumper(List<string> bumperArgs, double tsOffsetSeconds, HwEncoder hw, CancellationToken ct)
     {
-        var args = HwInit(useHw);
+        var args = HwInit(hw);
         var graph = bumperArgs.ToList();
-        if (useHw)
+        if (hw == HwEncoder.Vaapi)
         {
             var i = graph.IndexOf("-filter_complex");
             graph[i + 1] = graph[i + 1].Replace("format=yuv420p[bv]", "format=nv12,hwupload[bv]", StringComparison.Ordinal);
@@ -514,14 +520,30 @@ public class QuasiTvController : ControllerBase
 
         args.AddRange(graph);
         args.AddRange(new[] { "-map", "[bv]", "-map", "[ba]" });
-        args.AddRange(EncoderArgs(useHw, tsOffsetSeconds));
+        args.AddRange(EncoderArgs(hw, tsOffsetSeconds));
         await Pump(args, ct).ConfigureAwait(false);
     }
 
-    private static List<string> HwInit(bool useHw)
+    /// <summary>VA-API when its render device exists (Linux), VideoToolbox on macOS, otherwise software x264.</summary>
+    private static HwEncoder PickHardware()
+    {
+        if (!Config.UseHardwareEncoding)
+        {
+            return HwEncoder.None;
+        }
+
+        if (System.IO.File.Exists(Config.VaapiDevice))
+        {
+            return HwEncoder.Vaapi;
+        }
+
+        return OperatingSystem.IsMacOS() ? HwEncoder.VideoToolbox : HwEncoder.None;
+    }
+
+    private static List<string> HwInit(HwEncoder hw)
     {
         var args = new List<string> { "-hide_banner", "-loglevel", "error", "-nostdin" };
-        if (useHw)
+        if (hw == HwEncoder.Vaapi)
         {
             args.AddRange(new[] { "-init_hw_device", $"vaapi=va:{Config.VaapiDevice}", "-filter_hw_device", "va" });
         }
@@ -530,14 +552,18 @@ public class QuasiTvController : ControllerBase
     }
 
     /// <summary>Same output format for programs and bumpers, so they join into one continuous stream.</summary>
-    private static IEnumerable<string> EncoderArgs(bool useHw, double tsOffsetSeconds)
+    private static IEnumerable<string> EncoderArgs(HwEncoder hw, double tsOffsetSeconds)
     {
         var inv = CultureInfo.InvariantCulture;
         var kbps = Math.Clamp(Config.VideoBitrateKbps, 500, 20000);
         var args = new List<string>();
-        if (useHw)
+        if (hw == HwEncoder.Vaapi)
         {
             args.AddRange(new[] { "-c:v", "h264_vaapi", "-profile:v", "high", "-rc_mode", "VBR", "-bf", "0" });
+        }
+        else if (hw == HwEncoder.VideoToolbox)
+        {
+            args.AddRange(new[] { "-c:v", "h264_videotoolbox", "-profile:v", "high", "-realtime", "1", "-bf", "0", "-pix_fmt", "yuv420p" });
         }
         else
         {
@@ -657,4 +683,17 @@ public class QuasiTvController : ControllerBase
 
     private static string XmlTvTime(DateTime utc)
         => utc.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture) + " +0000";
+}
+
+/// <summary>Which encoder a channel stream uses.</summary>
+internal enum HwEncoder
+{
+    /// <summary>Software x264.</summary>
+    None,
+
+    /// <summary>VA-API (Intel/AMD on Linux).</summary>
+    Vaapi,
+
+    /// <summary>Apple VideoToolbox (macOS).</summary>
+    VideoToolbox
 }
